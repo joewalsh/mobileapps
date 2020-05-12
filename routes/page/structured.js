@@ -6,7 +6,7 @@ const mUtil = require('../../lib/mobile-util');
 const parsoid = require('../../lib/parsoid-access');
 const StructuredPage = require('../../lib/structured/StructuredPage');
 const api = require('../../lib/api-util');
-
+const mwapi = require('../../lib/mwapi');
 /**
  * The main router object
  */
@@ -24,10 +24,8 @@ function structuredPagePromiseFromHTML(app, req, res, html) {
         Vary: res.headers && res.headers.vary
     };
     meta.baseURI = mUtil.getMetaWikiRESTBaseAPIURI(app, req);
-    return BBPromise.props({
-        doc: mUtil.createDocument(html)
-    }).then((props) => {
-        return new StructuredPage(props.doc, meta).promise;
+    return mUtil.createDocument(html).then((doc) => {
+        return new StructuredPage(doc, meta).promise;
     });
 }
 
@@ -53,40 +51,79 @@ function getPageSummary(req, title) {
     return api.restApiGet(req, path, restReq);
 }
 
+function getWikibaseItem(req, title) {
+    const query = {
+        action: 'query',
+        prop: 'pageprops',
+        ppprop: 'wikibase_item',
+        titles: title,
+        format: 'json',
+        formatversion: 2
+    };
+
+    return mwapi.queryForMetadata(req, query, (page) => {
+        return {
+            body: {
+                wikibase_item: page.pageprops && page.pageprops.wikibase_item
+            }
+        };
+    });
+}
+
 /**
  * GET {domain}/v1/page/metadata/{title}{/revision}{/tid}
  * Gets extended metadata for a given wiki page.
  */
 router.get('/structured/:title/:revision?/:tid?', (req, res) => {
-    return BBPromise.props({
-        structuredPage: structuredPagePromise(app, req),
-        // mw: mwapi.getMetadataForMobileHtml(req)
-    }).then((response) => {
-        const linkedTitles = response.structuredPage.output.linkedTitles;
-        const keys = Object.keys(linkedTitles);
+    return structuredPagePromise(app, req).then((structuredPage) => {
+        res.status(200);
+        mUtil.setContentType(res, mUtil.CONTENT_TYPES.structuredPage);
+        mUtil.setETag(res, structuredPage.metadata.revision);
+        mUtil.setLanguageHeaders(res, structuredPage.metadata._headers);
+        mUtil.setContentSecurityPolicy(res, app.conf.mobile_html_csp);
+        delete structuredPage.output.linkedEntities;
+        res.json(structuredPage.output).end();
+        if (structuredPage.processingTime) {
+            app.metrics.timing('page_structured.processing', structuredPage.processingTime);
+        }
+    });
+});
+
+function hydratedEntities(req, res, useMediaWiki) {
+    return structuredPagePromise(app, req).then((structuredPage) => {
+        const linkedEntities = structuredPage.output.linkedEntities;
+        const keys = Object.keys(linkedEntities);
         for (var i = 0; i < keys.length; i++) {
             const title = keys[i];
-            linkedTitles[title] = getPageSummary(req, title).then(res => {
-                return res;
-            }, rej => {
-                return {};
-            });
+            if (useMediaWiki) {
+                linkedEntities[title] = getWikibaseItem(req, title).then(res => {
+                    return res;
+                }, () => {
+                    return {};
+                });
+            } else {
+                linkedEntities[title] = getPageSummary(req, title).then(res => {
+                    return res;
+                }, () => {
+                    return {};
+                });
+            }
         }
         // response.mobileHTML.addMediaWikiMetadata(response.mw);
-        return BBPromise.props(linkedTitles).then((summariesByTitle) => {
-            const keys = Object.keys(linkedTitles);
+        return BBPromise.props(linkedEntities).then((summariesByTitle) => {
+            const keys = Object.keys(linkedEntities);
             for (var i = 0; i < keys.length; i++) {
                 const title = keys[i];
                 const summaryResponse = summariesByTitle[title];
                 if (!summaryResponse
                     || !summaryResponse.body
                     || !summaryResponse.body.wikibase_item) {
-                    delete linkedTitles[title];
+                    delete linkedEntities[title];
                     continue;
                 }
-                linkedTitles[title] = summaryResponse.body.wikibase_item;
+                linkedEntities[title] = summaryResponse.body.wikibase_item;
             }
-            return response.structuredPage;
+            return structuredPage;
         });
     }).then((structuredPage) => {
         res.status(200);
@@ -99,6 +136,22 @@ router.get('/structured/:title/:revision?/:tid?', (req, res) => {
             app.metrics.timing('page_structured.processing', structuredPage.processingTime);
         }
     });
+}
+
+/**
+ * GET {domain}/v1/page/metadata/{title}{/revision}{/tid}
+ * Gets extended metadata for a given wiki page.
+ */
+router.get('/entities/:title/:revision?/:tid?', (req, res) => {
+    return hydratedEntities(req, res, false);
+});
+
+/**
+ * GET {domain}/v1/page/metadata/{title}{/revision}{/tid}
+ * Gets extended metadata for a given wiki page.
+ */
+router.get('/entities-mw/:title/:revision?/:tid?', (req, res) => {
+    return hydratedEntities(req, res, true);
 });
 
 module.exports = function(appObj) {

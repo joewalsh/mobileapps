@@ -89,21 +89,65 @@ function getWikibaseItem(req, title) {
     });
 }
 
+function getEntitiesForTitles(req, keys, useMediaWiki) {
+    const entitiesByTitle = {};
+    for (var i = 0; i < keys.length; i++) {
+        const title = keys[i];
+        if (useMediaWiki) {
+            entitiesByTitle[title] = getWikibaseItem(req, title).then(res => {
+                return res;
+            }, () => {
+                return {};
+            });
+        } else {
+            entitiesByTitle[title] = getPageSummary(req, title).then(res => {
+                return res;
+            }, () => {
+                return {};
+            });
+        }
+    }
+    // response.mobileHTML.addMediaWikiMetadata(response.mw);
+    return BBPromise.props(entitiesByTitle);
+}
+
 /**
  * GET {domain}/v1/page/facts/{title}{/revision}{/tid}
  * Gets extended metadata for a given wiki page.
  */
 router.get('/facts/:title/:revision?/:tid?', (req, res) => {
     return factsPromise(app, req).then((structuredPage) => {
+        const linkedEntities = structuredPage.output.linkedEntities;
+        const keys = Object.keys(linkedEntities);
+        return getEntitiesForTitles(req, keys, false).then((summariesByTitle) => {
+            for (const section of structuredPage.output.sections) {
+                for (const paragraph of section.paragraphs) {
+                    for (const fact of paragraph.facts) {
+                        for (const link of fact.links) {
+                            const title = link.title;
+                            const summaryResponse = summariesByTitle[title];
+                            if (!summaryResponse
+                                || !summaryResponse.body
+                                || !summaryResponse.body.wikibase_item) {
+                                continue;
+                            }
+                            link.wikidataItem = summaryResponse.body.wikibase_item;
+                        }
+                    }
+                }
+            }
+            delete structuredPage.output.linkedEntities;
+            return structuredPage;
+        });
+    }).then((structuredPage) => {
         res.status(200);
         mUtil.setContentType(res, mUtil.CONTENT_TYPES.structuredPage);
         mUtil.setETag(res, structuredPage.metadata.revision);
         mUtil.setLanguageHeaders(res, structuredPage.metadata._headers);
         mUtil.setContentSecurityPolicy(res, app.conf.mobile_html_csp);
-        delete structuredPage.output.linkedEntities;
         res.json(structuredPage.output).end();
         if (structuredPage.processingTime) {
-            app.metrics.timing('page_facts.processing', structuredPage.processingTime);
+            app.metrics.timing('page_structured.processing', structuredPage.processingTime);
         }
     });
 });
@@ -131,24 +175,7 @@ function hydratedEntities(req, res, useMediaWiki) {
     return structuredPagePromise(app, req).then((structuredPage) => {
         const linkedEntities = structuredPage.output.linkedEntities;
         const keys = Object.keys(linkedEntities);
-        for (var i = 0; i < keys.length; i++) {
-            const title = keys[i];
-            if (useMediaWiki) {
-                linkedEntities[title] = getWikibaseItem(req, title).then(res => {
-                    return res;
-                }, () => {
-                    return {};
-                });
-            } else {
-                linkedEntities[title] = getPageSummary(req, title).then(res => {
-                    return res;
-                }, () => {
-                    return {};
-                });
-            }
-        }
-        // response.mobileHTML.addMediaWikiMetadata(response.mw);
-        return BBPromise.props(linkedEntities).then((summariesByTitle) => {
+        return getEntitiesForTitles(req, keys, useMediaWiki).then((summariesByTitle) => {
             for (const section of structuredPage.output.sections) {
                 for (const paragraph of section.paragraphs) {
                     for (const link of paragraph.links) {
